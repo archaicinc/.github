@@ -1,0 +1,208 @@
+name: Reusable license PR review
+
+on:
+  workflow_call:
+    inputs:
+      enforcement:
+        description: "advisory or blocking"
+        required: false
+        type: string
+        default: advisory
+      forbidden_license_regex:
+        description: "Regex for licenses that should block/fail"
+        required: false
+        type: string
+        default: '(^|[^L])AGPL|(^|[^L])GPL'
+      review_license_regex:
+        description: "Regex for licenses that should appear in PR review"
+        required: false
+        type: string
+        default: 'AGPL|GPL|LGPL|Affero|General Public License|UNKNOWN|NOASSERTION|NONE'
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  license-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.enforcement }}" in
+            advisory|blocking) ;;
+            *) echo "enforcement must be advisory or blocking" >&2; exit 2 ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare reports directory
+        run: mkdir -p reports
+
+      - name: Generate SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: reports/sbom.cyclonedx.json
+
+      - name: Generate package table with Syft
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/repo" anchore/syft:latest /repo -o table > reports/packages.txt
+
+      - name: Scan licenses with Trivy
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/repo" aquasec/trivy:0.64.1 fs \
+            --scanners license \
+            --format json \
+            --output /repo/reports/trivy-license.json \
+            /repo
+
+      - name: Analyze license report
+        id: analyze
+        shell: python
+        env:
+          FORBIDDEN_LICENSE_REGEX: ${{ inputs.forbidden_license_regex }}
+          REVIEW_LICENSE_REGEX: ${{ inputs.review_license_regex }}
+          ENFORCEMENT: ${{ inputs.enforcement }}
+        run: |
+          import json, os, re
+          from pathlib import Path
+
+          data = json.loads(Path('reports/trivy-license.json').read_text())
+          forbidden_re = re.compile(os.environ['FORBIDDEN_LICENSE_REGEX'], re.I)
+          review_re = re.compile(os.environ['REVIEW_LICENSE_REGEX'], re.I)
+
+          def license_text_for(obj):
+              candidates = [
+                  obj.get('License'), obj.get('Licenses'), obj.get('LicenseExpression'),
+                  obj.get('LicenseFile'), obj.get('LicenseName'), obj.get('LicenseType'),
+              ]
+              texts = []
+              for value in candidates:
+                  if not value:
+                      continue
+                  if isinstance(value, list):
+                      texts.extend(str(v) for v in value)
+                  elif isinstance(value, dict):
+                      texts.append(json.dumps(value, ensure_ascii=False))
+                  else:
+                      texts.append(str(value))
+              return ', '.join(texts)
+
+          findings = []
+          for result in data.get('Results', []):
+              target = result.get('Target', '')
+              for pkg in result.get('Packages', []) or []:
+                  license_text = license_text_for(pkg)
+                  if not license_text or not review_re.search(license_text):
+                      continue
+                  findings.append({
+                      'package': pkg.get('Name') or pkg.get('PkgName') or 'unknown',
+                      'version': pkg.get('Version') or pkg.get('InstalledVersion') or '',
+                      'license': license_text,
+                      'file': pkg.get('FilePath') or target,
+                      'forbidden': bool(forbidden_re.search(license_text)),
+                  })
+              for vuln in result.get('Vulnerabilities', []) or []:
+                  license_text = license_text_for(vuln)
+                  if not license_text or not review_re.search(license_text):
+                      continue
+                  findings.append({
+                      'package': vuln.get('PkgName') or vuln.get('Name') or 'unknown',
+                      'version': vuln.get('InstalledVersion') or vuln.get('Version') or '',
+                      'license': license_text,
+                      'file': vuln.get('FilePath') or target,
+                      'forbidden': bool(forbidden_re.search(license_text)),
+                  })
+
+          unique, seen = [], set()
+          for f in findings:
+              key = (f['package'], f['version'], f['license'], f['file'])
+              if key not in seen:
+                  seen.add(key)
+                  unique.append(f)
+          unique.sort(key=lambda f: (not f['forbidden'], f['package'].lower(), f['version'], f['license']))
+          forbidden_count = sum(1 for f in unique if f['forbidden'])
+
+          lines = [
+              '<!-- archaic-license-review -->',
+              '## ライセンスレビュー / License review',
+              '',
+          ]
+          if unique:
+              lines += [
+                  f'GPL/AGPL/LGPL/unknown 系の確認対象が **{len(unique)}件** 見つかりました。うちブロック対象は **{forbidden_count}件** です。',
+                  '',
+                  '| Package | Version | License | Source | Risk |',
+                  '|---|---:|---|---|---|',
+              ]
+              for f in unique[:100]:
+                  risk = 'BLOCK' if f['forbidden'] else 'Review'
+                  lines.append(f"| `{f['package']}` | `{f['version']}` | `{f['license']}` | `{f['file']}` | **{risk}** |")
+              if len(unique) > 100:
+                  lines += ['', f'_Showing first 100 of {len(unique)} findings. See workflow artifacts for full reports._']
+          else:
+              lines.append('Trivy の検出範囲では GPL/AGPL/LGPL/unknown ライセンスは見つかりませんでした。')
+              lines.append('No GPL/AGPL/LGPL/unknown license findings were detected by Trivy.')
+
+          lines += [
+              '',
+              'Artifacts:',
+              '- `sbom.cyclonedx.json`',
+              '- `packages.txt`',
+              '- `trivy-license.json`',
+              '',
+              'Note: scanner output is triage, not legal advice. Check upstream `LICENSE` files for flagged packages.',
+          ]
+          Path('reports/license-review-comment.md').write_text('\n'.join(lines) + '\n')
+          Path('reports/license-findings.json').write_text(json.dumps(unique, indent=2, ensure_ascii=False) + '\n')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'forbidden_count={forbidden_count}\n')
+              out.write(f'finding_count={len(unique)}\n')
+
+      - name: Upload license artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-review
+          path: reports/
+          if-no-files-found: error
+
+      - name: Write job summary
+        shell: bash
+        run: cat reports/license-review-comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post sticky PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('reports/license-review-comment.md', 'utf8');
+            const marker = '<!-- archaic-license-review -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100
+            });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Enforce forbidden license policy
+        if: inputs.enforcement == 'blocking' && steps.analyze.outputs.forbidden_count != '0'
+        run: |
+          echo "Forbidden GPL/AGPL license findings detected: ${{ steps.analyze.outputs.forbidden_count }}"
+          exit 1
