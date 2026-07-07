@@ -183,8 +183,13 @@ jobs:
               # If it matches, include a bounded snippet around the actual matching text so
               # downstream review_re/forbidden_re sees the same signal that caused inclusion.
               raw_match = matching_snippet(license_value)
+              raw_match_review_only = False
               if raw_match:
-                  license_parts.append(raw_match)
+                  # Long free-form text from PyPI can include GPL compatibility notes or bundled-license
+                  # notices even when the project classifier is permissive. Keep the signal visible, but
+                  # don't auto-block GPL-only snippets with permissive classifiers; AGPL/Affero remains blocking.
+                  raw_match_review_only = bool(classifiers and not re.search(r'AGPL|AFFERO', raw_match, re.I))
+                  license_parts.append('Raw license text review snippet: ' + raw_match)
               elif license_value and not classifiers and len(license_value) <= 300 and '\n' not in license_value and '\r' not in license_value:
                   license_parts.append(license_value)
               license_parts.extend(classifiers)
@@ -201,6 +206,7 @@ jobs:
                   'License': ' | '.join(license_parts),
                   'Source': source,
                   'Manager': 'uv/pypi',
+                  'ReviewOnly': raw_match_review_only,
               }
 
           with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -298,7 +304,7 @@ jobs:
                   'version': pkg.get('Version') or '',
                   'license': license_text,
                   'file': pkg.get('Source') or 'uv.lock',
-                  'forbidden': bool(forbidden_re.search(license_text)),
+                  'forbidden': bool(forbidden_re.search(license_text)) and not bool(pkg.get('ReviewOnly')),
               })
 
           unique, seen = [], set()
