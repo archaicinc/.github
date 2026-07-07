@@ -66,6 +66,69 @@ jobs:
             --output /repo/reports/trivy-license.json \
             /repo
 
+      - name: Supplement Python uv.lock licenses from PyPI
+        shell: python
+        run: |
+          import json, pathlib, time, tomllib, urllib.error, urllib.parse, urllib.request
+
+          findings = []
+          cache = {}
+
+          def pypi_info(name, version):
+              key = (name.lower(), version)
+              if key in cache:
+                  return cache[key]
+              url = f"https://pypi.org/pypi/{urllib.parse.quote(name)}/{urllib.parse.quote(version)}/json"
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(url, timeout=20) as r:
+                          cache[key] = json.load(r).get('info', {})
+                          return cache[key]
+                  except Exception as exc:
+                      if attempt == 2:
+                          cache[key] = {'_error': str(exc)}
+                          return cache[key]
+                      time.sleep(2 * (attempt + 1))
+
+          for lock_path in pathlib.Path('.').rglob('uv.lock'):
+              try:
+                  data = tomllib.loads(lock_path.read_text())
+              except Exception as exc:
+                  findings.append({
+                      'Name': 'uv.lock',
+                      'Version': '',
+                      'License': f'UNKNOWN: failed to parse {lock_path}: {exc}',
+                      'Source': str(lock_path),
+                      'Manager': 'uv',
+                  })
+                  continue
+              for package in data.get('package', []):
+                  name = package.get('name')
+                  version = package.get('version')
+                  if not name or not version:
+                      continue
+                  info = pypi_info(name, version)
+                  license_parts = []
+                  license_value = (info.get('license') or '').strip()
+                  if license_value:
+                      license_parts.append(license_value)
+                  classifiers = [c for c in info.get('classifiers', []) if c.startswith('License ::')]
+                  license_parts.extend(classifiers)
+                  if info.get('_error'):
+                      license_parts.append(f"UNKNOWN: PyPI lookup failed: {info['_error']}")
+                  if not license_parts:
+                      # Do not flood reports with every package that omits metadata; Trivy/Syft artifacts still list packages.
+                      continue
+                  findings.append({
+                      'Name': name,
+                      'Version': version,
+                      'License': ' | '.join(license_parts),
+                      'Source': str(lock_path),
+                      'Manager': 'uv/pypi',
+                  })
+
+          pathlib.Path('reports/python-license-supplement.json').write_text(json.dumps(findings, indent=2, ensure_ascii=False) + '\n')
+
       - name: Analyze license report
         id: analyze
         shell: python
@@ -78,6 +141,8 @@ jobs:
           from pathlib import Path
 
           data = json.loads(Path('reports/trivy-license.json').read_text())
+          supplement_path = Path('reports/python-license-supplement.json')
+          python_supplement = json.loads(supplement_path.read_text()) if supplement_path.exists() else []
           forbidden_re = re.compile(os.environ['FORBIDDEN_LICENSE_REGEX'], re.I)
           review_re = re.compile(os.environ['REVIEW_LICENSE_REGEX'], re.I)
 
@@ -124,6 +189,18 @@ jobs:
                       'forbidden': bool(forbidden_re.search(license_text)),
                   })
 
+          for pkg in python_supplement:
+              license_text = str(pkg.get('License') or '')
+              if not license_text or not review_re.search(license_text):
+                  continue
+              findings.append({
+                  'package': pkg.get('Name') or 'unknown',
+                  'version': pkg.get('Version') or '',
+                  'license': license_text,
+                  'file': pkg.get('Source') or 'uv.lock',
+                  'forbidden': bool(forbidden_re.search(license_text)),
+              })
+
           unique, seen = [], set()
           for f in findings:
               key = (f['package'], f['version'], f['license'], f['file'])
@@ -160,6 +237,7 @@ jobs:
               '- `sbom.cyclonedx.json`',
               '- `packages.txt`',
               '- `trivy-license.json`',
+              '- `python-license-supplement.json`',
               '',
               'Note: scanner output is triage, not legal advice. Check upstream `LICENSE` files for flagged packages.',
           ]
