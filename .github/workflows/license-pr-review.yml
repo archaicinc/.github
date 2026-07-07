@@ -19,6 +19,9 @@ on:
         type: string
         default: 'AGPL|GPL|LGPL|Affero|General Public License|UNKNOWN|NOASSERTION|NONE'
 
+# pull_request_target guardrail: caller workflows should invoke this reusable workflow from
+# pull_request, not pull_request_target. This job checks out PR head code and needs
+# pull-requests: write only to maintain the sticky review comment.
 permissions:
   contents: read
   pull-requests: write
@@ -38,13 +41,13 @@ jobs:
           esac
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - name: Prepare reports directory
         run: mkdir -p reports
 
       - name: Generate SBOM with Syft
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
         with:
           path: .
           format: cyclonedx-json
@@ -54,13 +57,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD:/repo" anchore/syft:latest /repo -o table > reports/packages.txt
+          docker run --rm -v "$PWD:/repo" docker.io/anchore/syft@sha256:0d17fe46dc648a21c85cdfb67870371caa0efbeacf2451318eec61a629fc842c /repo -o table > reports/packages.txt
 
       - name: Scan licenses with Trivy
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD:/repo" aquasec/trivy:0.64.1 fs \
+          docker run --rm -v "$PWD:/repo" docker.io/aquasec/trivy@sha256:de90a656e79b175a294abe85cb8b99670fab83ebf339cccd163e6f584846809a fs \
             --scanners license \
             --format json \
             --output /repo/reports/trivy-license.json \
@@ -68,28 +71,82 @@ jobs:
 
       - name: Supplement Python uv.lock licenses from PyPI
         shell: python
+        timeout-minutes: 4
+        env:
+          FORBIDDEN_LICENSE_REGEX: ${{ inputs.forbidden_license_regex }}
+          REVIEW_LICENSE_REGEX: ${{ inputs.review_license_regex }}
+          PYPI_LOOKUP_MAX_PACKAGES: "300"
+          PYPI_LOOKUP_MAX_WORKERS: "8"
+          PYPI_LOOKUP_TOTAL_SECONDS: "150"
         run: |
-          import json, pathlib, time, tomllib, urllib.error, urllib.parse, urllib.request
+          import concurrent.futures, json, os, pathlib, re, threading, time, tomllib
+          import urllib.error, urllib.parse, urllib.request
 
           findings = []
+          lookup_errors = []
           cache = {}
+          cache_lock = threading.Lock()
+          review_re = re.compile(os.environ['REVIEW_LICENSE_REGEX'], re.I)
+          forbidden_re = re.compile(os.environ['FORBIDDEN_LICENSE_REGEX'], re.I)
+          max_packages = int(os.environ.get('PYPI_LOOKUP_MAX_PACKAGES', '300'))
+          max_workers = int(os.environ.get('PYPI_LOOKUP_MAX_WORKERS', '8'))
+          total_budget = float(os.environ.get('PYPI_LOOKUP_TOTAL_SECONDS', '150'))
+          deadline = time.monotonic() + total_budget
+
+          def compact(text, limit=420):
+              text = ' '.join(str(text).split())
+              return text if len(text) <= limit else text[:limit - 1] + '…'
+
+          def matching_snippet(text):
+              if not text:
+                  return ''
+              matches = []
+              for rx in (forbidden_re, review_re):
+                  m = rx.search(text)
+                  if m:
+                      matches.append(m)
+              if not matches:
+                  return ''
+              m = min(matches, key=lambda item: item.start())
+              start = max(0, m.start() - 180)
+              end = min(len(text), m.end() + 220)
+              prefix = '…' if start else ''
+              suffix = '…' if end < len(text) else ''
+              return compact(prefix + text[start:end] + suffix)
 
           def pypi_info(name, version):
               key = (name.lower(), version)
-              if key in cache:
-                  return cache[key]
-              url = f"https://pypi.org/pypi/{urllib.parse.quote(name)}/{urllib.parse.quote(version)}/json"
-              for attempt in range(3):
-                  try:
-                      with urllib.request.urlopen(url, timeout=20) as r:
-                          cache[key] = json.load(r).get('info', {})
-                          return cache[key]
-                  except Exception as exc:
-                      if attempt == 2:
-                          cache[key] = {'_error': str(exc)}
-                          return cache[key]
-                      time.sleep(2 * (attempt + 1))
+              with cache_lock:
+                  if key in cache:
+                      return cache[key]
+              if time.monotonic() > deadline:
+                  result = {'_error': 'PyPI lookup skipped: overall time budget exceeded'}
+              else:
+                  # Escape each path segment fully; uv.lock is PR-controlled input.
+                  url = f"https://pypi.org/pypi/{urllib.parse.quote(name, safe='')}/{urllib.parse.quote(version, safe='')}/json"
+                  result = None
+                  for attempt in range(2):
+                      try:
+                          with urllib.request.urlopen(url, timeout=8) as r:
+                              result = json.load(r).get('info', {})
+                              break
+                      except urllib.error.HTTPError as exc:
+                          if exc.code == 404:
+                              result = {'_not_found': True, '_error': 'PyPI lookup failed: HTTP 404 Not Found'}
+                              break
+                          result = {'_error': f'PyPI lookup failed: HTTP {exc.code}'}
+                      except Exception as exc:
+                          result = {'_error': f'PyPI lookup failed: {exc}'}
+                      if attempt == 0:
+                          time.sleep(0.5)
+                  if result is None:
+                      result = {'_error': 'PyPI lookup failed'}
+              with cache_lock:
+                  cache[key] = result
+              return result
 
+          packages = []
+          seen_packages = set()
           for lock_path in pathlib.Path('.').rglob('uv.lock'):
               try:
                   data = tomllib.loads(lock_path.read_text())
@@ -107,38 +164,70 @@ jobs:
                   version = package.get('version')
                   if not name or not version:
                       continue
-                  info = pypi_info(name, version)
-                  license_parts = []
-                  license_value = (info.get('license') or '').strip()
-                  classifiers = [c for c in info.get('classifiers', []) if c.startswith('License ::')]
-                  # Some PyPI projects put full license texts in `license`; those texts can mention GPL
-                  # compatibility or bundled notices even when the package license classifier is BSD/MIT/etc.
-                  # Prefer classifiers for long/free-form license text, but keep short values like PyMuPDF's
-                  # `Dual Licensed - GNU AFFERO GPL 3.0 or Artifex Commercial License`.
-                  license_value_is_long_text = len(license_value) > 300 or '\n' in license_value or '\r' in license_value
-                  if license_value and license_value_is_long_text:
-                      upper_prefix = license_value[:500].upper()
-                      if classifiers:
-                          pass
-                      elif any(token in upper_prefix for token in ['AFFERO', 'AGPL', 'GNU GENERAL PUBLIC LICENSE', 'GNU LESSER GENERAL PUBLIC LICENSE']):
-                          license_parts.append(license_value.splitlines()[0][:300])
-                  elif license_value:
-                      license_parts.append(license_value)
-                  license_parts.extend(classifiers)
-                  if info.get('_error'):
-                      license_parts.append(f"UNKNOWN: PyPI lookup failed: {info['_error']}")
-                  if not license_parts:
-                      # Do not flood reports with every package that omits metadata; Trivy/Syft artifacts still list packages.
+                  key = (name.lower(), version, str(lock_path))
+                  if key in seen_packages:
                       continue
-                  findings.append({
-                      'Name': name,
-                      'Version': version,
-                      'License': ' | '.join(license_parts),
-                      'Source': str(lock_path),
-                      'Manager': 'uv/pypi',
-                  })
+                  seen_packages.add(key)
+                  packages.append((name, version, str(lock_path)))
 
+          truncated = len(packages) > max_packages
+          packages = packages[:max_packages]
+
+          def inspect_package(item):
+              name, version, source = item
+              info = pypi_info(name, version)
+              license_parts = []
+              license_value = (info.get('license') or '').strip()
+              classifiers = [c for c in info.get('classifiers', []) if c.startswith('License ::')]
+              # Always evaluate the full free-form text with the caller-configured regexes.
+              # If it matches, include a bounded snippet around the actual matching text so
+              # downstream review_re/forbidden_re sees the same signal that caused inclusion.
+              raw_match = matching_snippet(license_value)
+              if raw_match:
+                  license_parts.append(raw_match)
+              elif license_value and not classifiers and len(license_value) <= 300 and '\n' not in license_value and '\r' not in license_value:
+                  license_parts.append(license_value)
+              license_parts.extend(classifiers)
+              if info.get('_not_found'):
+                  # A 404 can indicate an internal path/project package listed in uv.lock.
+                  license_parts.append(info['_error'])
+              elif info.get('_error'):
+                  lookup_errors.append({'Name': name, 'Version': version, 'Source': source, 'Error': info['_error']})
+              if not license_parts:
+                  return None
+              return {
+                  'Name': name,
+                  'Version': version,
+                  'License': ' | '.join(license_parts),
+                  'Source': source,
+                  'Manager': 'uv/pypi',
+              }
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+              future_map = {executor.submit(inspect_package, item): item for item in packages}
+              for future in concurrent.futures.as_completed(future_map, timeout=max(1, deadline - time.monotonic())):
+                  try:
+                      result = future.result()
+                      if result:
+                          findings.append(result)
+                  except Exception as exc:
+                      name, version, source = future_map[future]
+                      lookup_errors.append({'Name': name, 'Version': version, 'Source': source, 'Error': str(exc)})
+                  if time.monotonic() > deadline:
+                      break
+
+          metadata = {
+              'packages_seen': len(seen_packages),
+              'packages_processed': len(packages),
+              'truncated_by_cap': truncated,
+              'max_packages': max_packages,
+              'max_workers': max_workers,
+              'time_budget_seconds': total_budget,
+              'lookup_error_count': len(lookup_errors),
+              'lookup_errors_sample': lookup_errors[:20],
+          }
           pathlib.Path('reports/python-license-supplement.json').write_text(json.dumps(findings, indent=2, ensure_ascii=False) + '\n')
+          pathlib.Path('reports/python-license-supplement-meta.json').write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + '\n')
 
       - name: Analyze license report
         id: analyze
@@ -249,6 +338,7 @@ jobs:
               '- `packages.txt`',
               '- `trivy-license.json`',
               '- `python-license-supplement.json`',
+              '- `python-license-supplement-meta.json`',
               '',
               'Note: scanner output is triage, not legal advice. Check upstream `LICENSE` files for flagged packages.',
           ]
@@ -260,7 +350,7 @@ jobs:
               out.write(f'finding_count={len(unique)}\n')
 
       - name: Upload license artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: license-review
           path: reports/
@@ -272,7 +362,7 @@ jobs:
 
       - name: Post sticky PR comment
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
         with:
           script: |
             const fs = require('fs');
