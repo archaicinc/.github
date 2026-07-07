@@ -110,9 +110,14 @@ jobs:
                   info = pypi_info(name, version)
                   license_parts = []
                   license_value = (info.get('license') or '').strip()
-                  if license_value:
-                      license_parts.append(license_value)
                   classifiers = [c for c in info.get('classifiers', []) if c.startswith('License ::')]
+                  # Some PyPI projects put full license texts in `license`; those texts can mention GPL
+                  # compatibility or bundled notices even when the package license classifier is BSD/MIT/etc.
+                  # Prefer classifiers for long/free-form license text, but keep short values like PyMuPDF's
+                  # `Dual Licensed - GNU AFFERO GPL 3.0 or Artifex Commercial License`.
+                  license_value_is_long_text = len(license_value) > 300 or '\n' in license_value or '\r' in license_value
+                  if license_value and not (classifiers and license_value_is_long_text):
+                      license_parts.append(license_value)
                   license_parts.extend(classifiers)
                   if info.get('_error'):
                       license_parts.append(f"UNKNOWN: PyPI lookup failed: {info['_error']}")
