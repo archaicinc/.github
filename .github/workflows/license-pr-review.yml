@@ -116,7 +116,13 @@ jobs:
                   # Prefer classifiers for long/free-form license text, but keep short values like PyMuPDF's
                   # `Dual Licensed - GNU AFFERO GPL 3.0 or Artifex Commercial License`.
                   license_value_is_long_text = len(license_value) > 300 or '\n' in license_value or '\r' in license_value
-                  if license_value and not (classifiers and license_value_is_long_text):
+                  if license_value and license_value_is_long_text:
+                      upper_prefix = license_value[:500].upper()
+                      if classifiers:
+                          pass
+                      elif any(token in upper_prefix for token in ['AFFERO', 'AGPL', 'GNU GENERAL PUBLIC LICENSE', 'GNU LESSER GENERAL PUBLIC LICENSE']):
+                          license_parts.append(license_value.splitlines()[0][:300])
+                  elif license_value:
                       license_parts.append(license_value)
                   license_parts.extend(classifiers)
                   if info.get('_error'):
