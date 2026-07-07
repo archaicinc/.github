@@ -17,7 +17,7 @@ on:
         description: "Regex for licenses that should appear in PR review"
         required: false
         type: string
-        default: 'AGPL|GPL|LGPL|Affero|General Public License|UNKNOWN|NOASSERTION|NONE'
+        default: 'AGPL|Affero|GNU AFFERO|GNU GENERAL PUBLIC LICENSE|(^|[^L])GPL|UNKNOWN|NOASSERTION|NONE'
 
 # pull_request_target guardrail: caller workflows should invoke this reusable workflow from
 # pull_request, not pull_request_target. This job checks out PR head code and needs
@@ -183,13 +183,13 @@ jobs:
               # If it matches, include a bounded snippet around the actual matching text so
               # downstream review_re/forbidden_re sees the same signal that caused inclusion.
               raw_match = matching_snippet(license_value)
-              raw_match_review_only = False
               if raw_match:
-                  # Long free-form text from PyPI can include GPL compatibility notes or bundled-license
-                  # notices even when the project classifier is permissive. Keep the signal visible, but
-                  # don't auto-block GPL-only snippets with permissive classifiers; AGPL/Affero remains blocking.
-                  raw_match_review_only = bool(classifiers and not re.search(r'AGPL|AFFERO', raw_match, re.I))
-                  license_parts.append('Raw license text review snippet: ' + raw_match)
+                  # Long free-form text from PyPI often contains GPL compatibility tables or bundled
+                  # dependency notices even when the package classifier is permissive. Do not report
+                  # those as package-license findings. Keep only AGPL/Affero snippets (blocking) or
+                  # raw matches for packages with no license classifier to avoid hiding real signals.
+                  if not classifiers or re.search(r'AGPL|AFFERO', raw_match, re.I):
+                      license_parts.append('Raw license text review snippet: ' + raw_match)
               elif license_value and not classifiers and len(license_value) <= 300 and '\n' not in license_value and '\r' not in license_value:
                   license_parts.append(license_value)
               license_parts.extend(classifiers)
@@ -206,7 +206,6 @@ jobs:
                   'License': ' | '.join(license_parts),
                   'Source': source,
                   'Manager': 'uv/pypi',
-                  'ReviewOnly': raw_match_review_only,
               }
 
           with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -323,7 +322,7 @@ jobs:
           ]
           if unique:
               lines += [
-                  f'GPL/AGPL/LGPL/unknown 系の確認対象が **{len(unique)}件** 見つかりました。うちブロック対象は **{forbidden_count}件** です。',
+                  f'GPL/AGPL/unknown 系の確認対象が **{len(unique)}件** 見つかりました。うちブロック対象は **{forbidden_count}件** です。',
                   '',
                   '| Package | Version | License | Source | Risk |',
                   '|---|---:|---|---|---|',
@@ -334,8 +333,8 @@ jobs:
               if len(unique) > 100:
                   lines += ['', f'_Showing first 100 of {len(unique)} findings. See workflow artifacts for full reports._']
           else:
-              lines.append('Trivy の検出範囲では GPL/AGPL/LGPL/unknown ライセンスは見つかりませんでした。')
-              lines.append('No GPL/AGPL/LGPL/unknown license findings were detected by Trivy.')
+              lines.append('Trivy の検出範囲では GPL/AGPL/unknown ライセンスは見つかりませんでした。')
+              lines.append('No GPL/AGPL/unknown license findings were detected by Trivy.')
 
           lines += [
               '',
