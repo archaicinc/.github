@@ -18,10 +18,15 @@ on:
         required: false
         type: string
         default: 'AGPL|Affero|GNU AFFERO|GNU GENERAL PUBLIC LICENSE|(^|[^L])GPL|UNKNOWN|NOASSERTION|NONE'
+      post_pr_comment:
+        description: "Post/update a sticky PR comment. Keep false to avoid Slack/email PR-comment notifications. Reports are still in job summary/artifacts."
+        required: false
+        type: boolean
+        default: false
 
 # pull_request_target guardrail: caller workflows should invoke this reusable workflow from
-# pull_request, not pull_request_target. This job checks out PR head code and needs
-# pull-requests: write only to maintain the sticky review comment.
+# pull_request, not pull_request_target. By default this workflow avoids PR comments
+# to prevent Slack/email notification noise; reports are in job summary/artifacts.
 permissions:
   contents: read
   pull-requests: write
@@ -366,7 +371,7 @@ jobs:
         run: cat reports/license-review-comment.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Post sticky PR comment
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && inputs.post_pr_comment
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
         with:
           script: |
